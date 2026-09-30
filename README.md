@@ -27,7 +27,7 @@ Both paths follow the same overall workflow:
 
 Open the app here:
 
-**[AOI Raster Fetcher](https://wms-wcs-aoi-fetcher.adel-bchini.workers.dev/)**
+**[AOI Raster Fetcher](https://wms-wcs-aoi-fetcher.bchini.workers.dev/)**
 
 Paste a WMS or WCS URL and press **DETECT**. The interface tries to infer everything automatically:
 
