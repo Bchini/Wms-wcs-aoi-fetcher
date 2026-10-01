@@ -1,11 +1,11 @@
-// Reads only the coordinates out of a GeoJSON document to compute its
-// bounding box in EPSG:4326 -- the CRS every GeoJSON coordinate is in, per
-// RFC 7946, regardless of Feature/FeatureCollection/GeometryCollection
-// nesting or which geometry type it is. This app clips an AOI to that
-// bounding box (not the exact polygon shape): a real cutline would need a
-// full vector reprojection/rasterization step this client-side pipeline
-// doesn't carry. No shapefile/KML support -- those need a real parser (or
-// GDAL/OGR itself) this app doesn't run client-side either.
+// Reads a GeoJSON document two ways: boundsFromGeoJson() for its overall
+// bounding box in EPSG:4326 (used to shrink the requested extent/resolution
+// budget, for any geometry type), and polygonsFromGeoJson() for its actual
+// polygon rings (used together with web/geometry.js to decide which WMS
+// tiles really touch the AOI shape, not just its bounding box). Every
+// GeoJSON coordinate is EPSG:4326 per RFC 7946. No shapefile/KML support --
+// those need a real parser (or GDAL/OGR itself) this app doesn't run
+// client-side.
 
 function walkCoordinates(node, onPoint) {
   if (!Array.isArray(node)) return;
@@ -60,4 +60,34 @@ export function boundsFromGeoJson(geojson) {
     throw new Error('This AOI has no area (looks like a single point, not a polygon).');
   }
   return [minLon, minLat, maxLon, maxLat];
+}
+
+function collectPolygons(geometry, out) {
+  if (!geometry) return;
+  if (geometry.type === 'Polygon') out.push(geometry.coordinates);
+  else if (geometry.type === 'MultiPolygon') out.push(...geometry.coordinates);
+  else if (geometry.type === 'GeometryCollection') {
+    for (const child of geometry.geometries || []) collectPolygons(child, out);
+  }
+}
+
+/**
+ * Every polygon in a parsed GeoJSON document, each as an array of rings
+ * (outer ring first, holes after, per GeoJSON's own Polygon/MultiPolygon
+ * nesting), all in EPSG:4326. Non-polygon geometries (Point, LineString)
+ * are skipped -- there's no "does a tile touch this" test for a bare point
+ * or line that's more useful than the bounding-box fallback already covers.
+ * Returns [] if the document has no polygon geometry at all.
+ */
+export function polygonsFromGeoJson(geojson) {
+  const polygons = [];
+  const type = geojson?.type;
+  if (type === 'FeatureCollection') {
+    for (const feature of geojson.features || []) collectPolygons(feature?.geometry, polygons);
+  } else if (type === 'Feature') {
+    collectPolygons(geojson.geometry, polygons);
+  } else if (type) {
+    collectPolygons(geojson, polygons);
+  }
+  return polygons;
 }

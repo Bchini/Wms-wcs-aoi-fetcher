@@ -39,9 +39,10 @@ Paste a WMS or WCS URL and press **DETECT**. The interface tries to infer everyt
 The app then proposes resolution presets sized for the actual area selected, keeping the request under the configured pixel and tile budgets. Two optional refinements are available once a URL is detected:
 
 - **Custom resolution** — type an exact output width (in pixels) instead of picking a preset, for the sharpest result the pixel/tile budget allows.
-- **AOI upload** — upload a GeoJSON polygon to download only that zone instead of the full detected extent (clipped to the AOI's bounding box). This also lets the resolution go sharper, since the same pixel/tile budget is now spent on a smaller area. Only supported when the detected service is in EPSG:4326 or EPSG:3857; other CRS fall back to the full extent with a clear message.
+- **AOI upload** — upload a GeoJSON polygon to shrink the requested extent to that AOI's bounding box instead of the full detected extent. This also lets the resolution go sharper, since the same pixel/tile budget is now spent on a smaller area. Only supported when the detected service is in EPSG:4326 or EPSG:3857; other CRS fall back to the full extent with a clear message.
+- **Tile picker** — for a multi-tile WMS request, a small OpenStreetMap-based map shows every planned tile as a clickable rectangle. Click any tile to leave it out of the download (it stays blank in the final mosaic); use *Select all* / *Clear* to reset. Uploading an AOI auto-preselects only the tiles that actually touch its real polygon shape (not just its bounding box) — click afterwards to fine-tune. Not shown for WCS (never tiled) or when there's only one tile.
 
-If a layer restricts its own rendering to a fine scale (e.g. a per-building GeoServer style with `MaxScaleDenominator`), the app warns when the current resolution/AOI combination would come back blank, and the warning updates live as you adjust either one.
+If a layer restricts its own rendering to a fine scale (e.g. a per-building GeoServer style with `MaxScaleDenominator`), the app warns when the current resolution/AOI combination would come back blank, and the warning updates live as you adjust any of the above.
 
 ## Why WCS vs WMS matters
 

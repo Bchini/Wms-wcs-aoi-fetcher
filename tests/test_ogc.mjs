@@ -11,6 +11,12 @@ import {
   customResolution,
   reprojectAoiBounds,
   intersectBounds,
+  webMercatorToLonLat,
+  reprojectLonLat,
+  reprojectPointToLonLat,
+  reprojectPolygonsToCrs,
+  tileKey,
+  tilesIntersectingPolygons,
 } from '../web/ogc.js';
 
 test('wmsBbox: WMS 1.3 EPSG:4326 uses latitude first', () => {
@@ -165,4 +171,60 @@ test('intersectBounds: overlapping boxes', () => {
 
 test('intersectBounds: null when the boxes do not overlap', () => {
   assert.equal(intersectBounds([0, 0, 1, 1], [5, 5, 6, 6]), null);
+});
+
+test('webMercatorToLonLat is the inverse of lonLatToWebMercator', () => {
+  const [x, y] = [835_690, 5_430_798];
+  const [lon, lat] = webMercatorToLonLat(x, y);
+  const back = reprojectLonLat(lon, lat, 'EPSG:3857');
+  assert.ok(Math.abs(back[0] - x) < 1e-3);
+  assert.ok(Math.abs(back[1] - y) < 1e-3);
+});
+
+test('reprojectLonLat: EPSG:4326/CRS:84 pass through, EPSG:3857 converts, others are null', () => {
+  assert.deepEqual(reprojectLonLat(7.5, 43.8, 'EPSG:4326'), [7.5, 43.8]);
+  assert.deepEqual(reprojectLonLat(7.5, 43.8, 'CRS:84'), [7.5, 43.8]);
+  assert.notEqual(reprojectLonLat(7.5, 43.8, 'EPSG:3857')[0], 7.5);
+  assert.equal(reprojectLonLat(7.5, 43.8, 'EPSG:25832'), null);
+});
+
+test('reprojectPointToLonLat round-trips through EPSG:3857', () => {
+  const [x, y] = reprojectLonLat(7.5, 43.8, 'EPSG:3857');
+  const [lon, lat] = reprojectPointToLonLat(x, y, 'EPSG:3857');
+  assert.ok(Math.abs(lon - 7.5) < 1e-6);
+  assert.ok(Math.abs(lat - 43.8) < 1e-6);
+});
+
+test('reprojectPolygonsToCrs reprojects every vertex, preserving ring structure', () => {
+  const polygons = [[[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]];
+  const reprojected = reprojectPolygonsToCrs(polygons, 'EPSG:3857');
+  assert.equal(reprojected.length, 1);
+  assert.equal(reprojected[0][0].length, 5);
+  assert.ok(Math.abs(reprojected[0][0][0][0]) < 1e-6 && Math.abs(reprojected[0][0][0][1]) < 1e-6);
+  assert.ok(reprojected[0][0][1][0] > 0); // lon=1 -> positive x in Web Mercator
+});
+
+test('reprojectPolygonsToCrs returns null for an unsupported CRS', () => {
+  const polygons = [[[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]];
+  assert.equal(reprojectPolygonsToCrs(polygons, 'EPSG:25832'), null);
+});
+
+test('tileKey is stable and unique per row/col', () => {
+  assert.equal(tileKey({ row: 1, col: 2 }), '1,2');
+  assert.notEqual(tileKey({ row: 1, col: 2 }), tileKey({ row: 2, col: 1 }));
+});
+
+test('tilesIntersectingPolygons: only tiles actually touching a triangular AOI are selected', () => {
+  const tiles = [
+    { row: 0, col: 0, txmin: 0, tymin: 0, txmax: 10, tymax: 10 },
+    { row: 0, col: 1, txmin: 10, tymin: 0, txmax: 20, tymax: 10 },
+    { row: 1, col: 0, txmin: 0, tymin: 10, txmax: 10, tymax: 20 },
+    { row: 1, col: 1, txmin: 10, tymin: 10, txmax: 20, tymax: 20 }, // well clear of the triangle below
+  ];
+  // Triangle (0,0)-(15,0)-(0,15): reaches into the bottom-left, bottom-right
+  // and top-left tiles, but stays 5 units clear of the top-right tile's
+  // nearest corner (10,10) -- no boundary-touching ambiguity.
+  const triangle = [[[[0, 0], [15, 0], [0, 15], [0, 0]]]];
+  const selected = tilesIntersectingPolygons(tiles, triangle);
+  assert.deepEqual([...selected].sort(), ['0,0', '0,1', '1,0']);
 });

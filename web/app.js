@@ -8,9 +8,14 @@ import {
   reprojectAoiBounds,
   intersectBounds,
   scaleWarningText,
+  reprojectPointToLonLat,
+  reprojectPolygonsToCrs,
+  tileKey,
+  tilesIntersectingPolygons,
 } from './ogc.js';
-import { boundsFromGeoJson } from './aoi.js';
+import { boundsFromGeoJson, polygonsFromGeoJson } from './aoi.js';
 import { runWcs, runWms } from './gdal-runner.js';
+import { createTilePicker } from './tile-picker.js';
 
 const form = document.querySelector('#fetch-form');
 const urlField = document.querySelector('#service-url');
@@ -23,6 +28,11 @@ const aoiStatus = document.querySelector('#aoi-status');
 const aoiActions = document.querySelector('#aoi-actions');
 const aoiClearButton = document.querySelector('#aoi-clear');
 const scaleWarningEl = document.querySelector('#scale-warning');
+const tilePickerSection = document.querySelector('#tile-picker-section');
+const tilePickerMap = document.querySelector('#tile-picker-map');
+const tilePickerStatus = document.querySelector('#tile-picker-status');
+const tilePickerSelectAll = document.querySelector('#tile-picker-select-all');
+const tilePickerClearButton = document.querySelector('#tile-picker-clear');
 const processStatus = document.querySelector('#process-status');
 const launchButton = document.querySelector('#launch-button');
 const progressTrack = document.querySelector('#progress-track');
@@ -44,12 +54,23 @@ const DEFAULT_STATUS = "Paste a link and press DETECT to see the layer and choos
 let detected = null; // the last /api/resolve() result
 let detectedForUrl = null; // the URL string it was resolved from
 let aoiBounds = null; // an uploaded AOI's bbox, reprojected + intersected with detected.bounds
+let aoiPolygonsLonLat = null; // the same AOI's actual polygon rings (EPSG:4326), for true-shape tile selection
+let tilePicker = null; // the active createTilePicker() instance, or null (WCS, >1 tile unsupported CRS, or just 1 tile)
+let tilePickerTiles = []; // the exact tile list `tilePicker` was built from -- compared by length at download time as a cheap staleness guard
 
 function resetAoi() {
   aoiBounds = null;
+  aoiPolygonsLonLat = null;
   aoiFileInput.value = '';
   aoiStatus.hidden = true;
   aoiActions.hidden = true;
+}
+
+function destroyTilePicker() {
+  if (tilePicker) tilePicker.destroy();
+  tilePicker = null;
+  tilePickerTiles = [];
+  tilePickerSection.hidden = true;
 }
 
 function resetDetection() {
@@ -59,6 +80,7 @@ function resetDetection() {
   scaleWarningEl.hidden = true;
   customWidthInput.value = '';
   resetAoi();
+  destroyTilePicker();
   launchButton.textContent = 'DETECT';
   processStatus.textContent = DEFAULT_STATUS;
 }
@@ -95,6 +117,74 @@ function formatCoord(n) {
   return Math.round(n * 1e5) / 1e5;
 }
 
+const TILE_PICKER_CRS = new Set(['EPSG:4326', 'CRS:84', 'EPSG:3857', 'EPSG:900913']);
+
+function updateTilePickerStatus() {
+  if (!tilePicker) return;
+  const n = tilePicker.getSelection().size;
+  const total = tilePickerTiles.length;
+  tilePickerStatus.textContent = `${n} of ${total} tile${total > 1 ? 's' : ''} selected — click a tile to toggle it.`;
+}
+
+/**
+ * (Re)build the tile-selection map for the current bounds/resolution, or
+ * hide it when there's nothing to usefully pick from: WCS (never tiled),
+ * a CRS the map can't display, or just a single tile. Called after every
+ * change that affects the tile grid's shape (resolution, AOI) so the
+ * picker shown is always the one `resolveRunParams()` will actually use --
+ * runDownload() double-checks this by comparing tile counts before trusting
+ * the picker's selection.
+ */
+async function rebuildTilePicker() {
+  if (!detected || detected.service !== 'wms') {
+    destroyTilePicker();
+    return;
+  }
+  let resolution;
+  try {
+    ({ resolution } = resolveRunParams(detected));
+  } catch {
+    destroyTilePicker(); // an over-budget custom width -- the real error shows up when DOWNLOAD is pressed
+    return;
+  }
+  const bounds = effectiveBounds();
+  const [minx, miny, maxx, maxy] = bounds;
+  const tiles = planWmsTiles({ minx, miny, maxx, maxy, tileW: WMS_TILE_SIZE, tileH: WMS_TILE_SIZE, resolution });
+
+  if (!TILE_PICKER_CRS.has(detected.crs.toUpperCase()) || tiles.length <= 1) {
+    destroyTilePicker();
+    return;
+  }
+
+  let initialSelection = null;
+  if (aoiPolygonsLonLat && aoiPolygonsLonLat.length) {
+    const reprojected = reprojectPolygonsToCrs(aoiPolygonsLonLat, detected.crs);
+    if (reprojected) initialSelection = tilesIntersectingPolygons(tiles, reprojected);
+  }
+
+  if (tilePicker) tilePicker.destroy();
+  tilePickerSection.hidden = false;
+  tilePickerTiles = tiles;
+  tilePicker = await createTilePicker(tilePickerMap, {
+    tiles,
+    toLonLat: (x, y) => reprojectPointToLonLat(x, y, detected.crs),
+    initialSelection,
+    onChange: updateTilePickerStatus,
+  });
+  updateTilePickerStatus();
+}
+resolutionSelect.addEventListener('change', rebuildTilePicker);
+customWidthInput.addEventListener('change', rebuildTilePicker);
+
+tilePickerSelectAll.addEventListener('click', () => {
+  if (!tilePicker) return;
+  tilePicker.setSelection(tilePickerTiles.map(tileKey));
+});
+tilePickerClearButton.addEventListener('click', () => {
+  if (!tilePicker) return;
+  tilePicker.setSelection([]);
+});
+
 aoiFileInput.addEventListener('change', async () => {
   const file = aoiFileInput.files[0];
   if (!file) return;
@@ -119,6 +209,7 @@ aoiFileInput.addEventListener('change', async () => {
       throw new Error("This AOI doesn't overlap the detected layer's extent.");
     }
     aoiBounds = clipped;
+    aoiPolygonsLonLat = polygonsFromGeoJson(geojson); // [] for a non-polygon AOI -- tile picking then just uses the bbox clip above
     aoiActions.hidden = false;
     aoiStatus.hidden = false;
     aoiStatus.classList.remove('is-error');
@@ -128,6 +219,7 @@ aoiFileInput.addEventListener('change', async () => {
       `${formatCoord(maxx)}, ${formatCoord(maxy)} (${detected.crs}).`;
   } catch (error) {
     aoiBounds = null;
+    aoiPolygonsLonLat = null;
     aoiFileInput.value = '';
     aoiActions.hidden = true;
     aoiStatus.hidden = false;
@@ -136,13 +228,15 @@ aoiFileInput.addEventListener('change', async () => {
   }
   populateResolutionSelect(detected, effectiveBounds());
   refreshScaleWarning();
+  await rebuildTilePicker();
 });
 
-aoiClearButton.addEventListener('click', () => {
+aoiClearButton.addEventListener('click', async () => {
   resetAoi();
   if (detected) {
     populateResolutionSelect(detected, effectiveBounds());
     refreshScaleWarning();
+    await rebuildTilePicker();
   }
 });
 
@@ -247,6 +341,7 @@ async function detect(url) {
     detectedSummary.textContent =
       `${resolved.service.toUpperCase()} · ${resolved.layer} · ${resolved.crs}`;
     refreshScaleWarning();
+    await rebuildTilePicker();
     processStatus.textContent = 'Choose a resolution, then press DOWNLOAD GEOTIFF.';
     launchButton.textContent = 'DOWNLOAD GEOTIFF';
   } catch (error) {
@@ -302,10 +397,18 @@ async function runDownload(resolved, bounds, resolution) {
       );
     } else {
       const [minx, miny, maxx, maxy] = bounds;
-      const tiles = planWmsTiles({
-        minx, miny, maxx, maxy,
-        tileW: WMS_TILE_SIZE, tileH: WMS_TILE_SIZE, resolution,
-      }).map((tile) => ({
+      let tiles = planWmsTiles({ minx, miny, maxx, maxy, tileW: WMS_TILE_SIZE, tileH: WMS_TILE_SIZE, resolution });
+      // Only apply the tile-picker's selection if it was built from this
+      // exact grid (same tile count) -- a mismatch means the picker is
+      // stale (shouldn't happen, rebuildTilePicker() runs on every change
+      // that affects the grid, but this is a cheap guard against silently
+      // dropping tiles the user never meant to deselect).
+      if (tilePicker && tilePickerTiles.length === tiles.length) {
+        const selection = tilePicker.getSelection();
+        tiles = tiles.filter((tile) => selection.has(tileKey(tile)));
+        if (!tiles.length) throw new Error('Select at least one tile on the map before downloading.');
+      }
+      tiles = tiles.map((tile) => ({
         ...tile,
         url: serviceUrl(resolved.endpoint, {
           service: 'WMS',

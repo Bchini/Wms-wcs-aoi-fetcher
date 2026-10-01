@@ -1,6 +1,7 @@
 // OGC WMS/WCS request-building helpers. Pure functions, no GDAL/network
 // dependency -- a browser-side port of the same logic in fetch.py, so the
 // CLI and the web app agree on how a BBOX/tile grid is built.
+import { polygonIntersectsRect } from './geometry.js';
 
 /** Return a WMS BBOX string, accounting for the WMS 1.3 EPSG:4326 axis order. */
 export function wmsBbox(minx, miny, maxx, maxy, crs, version) {
@@ -191,6 +192,74 @@ export function intersectBounds(a, b) {
   const maxy = Math.min(a[3], b[3]);
   if (minx >= maxx || miny >= maxy) return null;
   return [minx, miny, maxx, maxy];
+}
+
+// -- Tile selection: deciding which planned WMS tiles an AOI polygon (its
+// real shape, not just its bounding box) actually touches, and placing the
+// tile grid on a Leaflet (always-EPSG:4326-lat/lng) map regardless of which
+// CRS the tiles themselves are requested in.
+
+/** The inverse of lonLatToWebMercator(). */
+export function webMercatorToLonLat(x, y) {
+  const lon = (x / WEB_MERCATOR_RADIUS) * (180 / Math.PI);
+  const lat = (2 * Math.atan(Math.exp(y / WEB_MERCATOR_RADIUS)) - Math.PI / 2) * (180 / Math.PI);
+  return [lon, lat];
+}
+
+/** Reproject a single EPSG:4326 [lon, lat] point into `toCrs`; null if unsupported (see reprojectAoiBounds). */
+export function reprojectLonLat(lon, lat, toCrs) {
+  const target = toCrs.toUpperCase();
+  if (target === 'EPSG:4326' || target === 'CRS:84') return [lon, lat];
+  if (target === 'EPSG:3857' || target === 'EPSG:900913') return lonLatToWebMercator(lon, lat);
+  return null;
+}
+
+/** The inverse of reprojectLonLat(): a point in `fromCrs` back to EPSG:4326 [lon, lat]; null if unsupported. */
+export function reprojectPointToLonLat(x, y, fromCrs) {
+  const source = fromCrs.toUpperCase();
+  if (source === 'EPSG:4326' || source === 'CRS:84') return [x, y];
+  if (source === 'EPSG:3857' || source === 'EPSG:900913') return webMercatorToLonLat(x, y);
+  return null;
+}
+
+/**
+ * Reproject every vertex of every polygon (as returned by aoi.js's
+ * polygonsFromGeoJson(), always EPSG:4326) into `toCrs`. Returns null if
+ * `toCrs` isn't a supported case -- same closed-form limitation as
+ * reprojectAoiBounds(), applied point-by-point instead of to just the bbox
+ * corners.
+ */
+export function reprojectPolygonsToCrs(polygons, toCrs) {
+  const reprojected = [];
+  for (const rings of polygons) {
+    const reprojectedRings = [];
+    for (const ring of rings) {
+      const reprojectedRing = [];
+      for (const [lon, lat] of ring) {
+        const point = reprojectLonLat(lon, lat, toCrs);
+        if (!point) return null;
+        reprojectedRing.push(point);
+      }
+      reprojectedRings.push(reprojectedRing);
+    }
+    reprojected.push(reprojectedRings);
+  }
+  return reprojected;
+}
+
+/** A stable identifier for a planWmsTiles() tile, for use as a Set/Map key. */
+export function tileKey(tile) {
+  return `${tile.row},${tile.col}`;
+}
+
+/** Keys of every tile in `tiles` whose rectangle overlaps any polygon in `polygons` (already in the tiles' own CRS). */
+export function tilesIntersectingPolygons(tiles, polygons) {
+  const keys = new Set();
+  for (const tile of tiles) {
+    const rect = [tile.txmin, tile.tymin, tile.txmax, tile.tymax];
+    if (polygons.some((rings) => polygonIntersectsRect(rings, rect))) keys.add(tileKey(tile));
+  }
+  return keys;
 }
 
 /**
