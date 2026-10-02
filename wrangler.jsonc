@@ -16,6 +16,15 @@
       "migrations_dir": "migrations"
     }
   ],
+  // Per-IP limits (see rateLimited() in src/worker.mjs). The proxy allowance
+  // is generous on purpose: one 64-tile download is 64 requests in a burst.
+  // namespace_id is an arbitrary number that only has to be unique within
+  // this Cloudflare account.
+  "ratelimits": [
+    { "name": "PROXY_LIMITER", "namespace_id": "7101", "simple": { "limit": 300, "period": 60 } },
+    { "name": "API_LIMITER", "namespace_id": "7102", "simple": { "limit": 30, "period": 60 } },
+    { "name": "FEEDBACK_LIMITER", "namespace_id": "7103", "simple": { "limit": 5, "period": 60 } }
+  ],
   // NOTIFY_EMAIL is the destination for feedback notifications (see
   // notifyFeedback() in src/worker.mjs) -- not secret, just a plain address.
   // The other half, RESEND_API_KEY, is a secret and is NOT set here; set it

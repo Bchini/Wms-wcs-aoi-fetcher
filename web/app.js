@@ -315,7 +315,8 @@ function showProgress() {
 function updateProgress({ phase, done, total }) {
   const fraction = total ? done / total : 0;
   let percent = 0;
-  if (phase === 'fetching') percent = 5 + 55 * fraction;
+  if (phase === 'tiles') percent = 5 + 80 * fraction; // WMS: download + draw, one step per tile
+  else if (phase === 'fetching') percent = 5 + 55 * fraction;
   else if (phase === 'processing') percent = 60 + 25 * fraction;
   else if (phase === 'compositing') percent = 85 + 13 * fraction;
   setProgress(Math.min(98, percent));

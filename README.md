@@ -154,7 +154,10 @@ Some government WMS/WCS endpoints reject requests from cloud or foreign IP range
 - `--max-tiles` refuses a WMS job before it starts if the AOI, resolution and tile size would exceed the configured tile budget,
 - `--cleanup` removes intermediate files such as `_RAW.tif`, `_MOSAIC.tif`, `.vrt` and the WMS tile cache once the final output exists,
 - failed runs exit with a short `error: ...` message on stderr instead of a Python traceback,
-- the app enforces a maximum pixel budget to avoid unexpectedly huge GeoTIFF generation.
+- the app enforces a maximum pixel budget to avoid unexpectedly huge GeoTIFF generation,
+- the web app's Worker only fetches public `http(s)` hosts: local names, private/reserved IPv4 ranges and IPv6 literals are refused, and every redirect hop is re-checked (`src/safe-fetch.mjs`),
+- request bodies and proxied responses are size-capped on the bytes actually received, not just the declared `Content-Length`,
+- per-IP rate limits (`ratelimits` in `wrangler.jsonc`) cap the proxy, the resolver and the feedback form.
 
 ## Output
 

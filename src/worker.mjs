@@ -6,6 +6,7 @@
 // web/gdal-runner.js) -- there is no server-side processing at all, which is
 // what keeps this app on Cloudflare's free Workers plan.
 import { interpretUrl, ResolveError } from "./resolve.mjs";
+import { safeFetch, UnsafeUrlError } from "./safe-fetch.mjs";
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=UTF-8",
@@ -37,6 +38,54 @@ function sameOrigin(request) {
   // it is the real defense against another site's JS driving our proxy.
   const site = request.headers.get("Sec-Fetch-Site");
   return !site || site === "same-origin" || site === "none";
+}
+
+// Requests with neither header (curl, scripts) pass sameOrigin() -- any
+// header can be forged outside a browser, so that check only stops other
+// *websites* from driving the proxy. What stops a script from hammering it is
+// a per-IP limit. The bindings are optional (see wrangler.jsonc): without
+// them (local tests) nothing is limited.
+async function rateLimited(env, binding, request) {
+  const limiter = env[binding];
+  if (!limiter) return false;
+  const key = request.headers.get("CF-Connecting-IP") || "unknown";
+  const { success } = await limiter.limit({ key });
+  return !success;
+}
+
+/**
+ * Read a JSON request body, refusing more than `maxBytes` of it. A
+ * Content-Length check alone is bypassable with chunked transfer encoding,
+ * so the bytes are counted as they arrive.
+ */
+async function readJsonBody(request, maxBytes) {
+  if (Number(request.headers.get("content-length") || 0) > maxBytes) return { error: "too-large" };
+  const reader = request.body?.getReader();
+  if (!reader) return { error: "invalid" };
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      return { error: "too-large" };
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const payload = JSON.parse(new TextDecoder().decode(merged));
+    return payload && typeof payload === "object" ? { payload } : { error: "invalid" };
+  } catch {
+    return { error: "invalid" };
+  }
 }
 
 // Best-effort notification email via Resend (https://resend.com) -- a
@@ -83,16 +132,13 @@ async function saveFeedback(request, env, ctx) {
   if (!request.headers.get("content-type")?.includes("application/json")) {
     return json({ error: "JSON body required" }, 415);
   }
-  if (Number(request.headers.get("content-length") || 0) > MAX_FEEDBACK_BYTES) {
-    return json({ error: "Feedback report is too large" }, 413);
+  if (await rateLimited(env, "FEEDBACK_LIMITER", request)) {
+    return json({ error: "Too many reports -- please wait a minute." }, 429);
   }
 
-  let payload;
-  try {
-    payload = await request.json();
-  } catch {
-    return json({ error: "Invalid JSON" }, 400);
-  }
+  const { payload, error } = await readJsonBody(request, MAX_FEEDBACK_BYTES);
+  if (error === "too-large") return json({ error: "Feedback report is too large" }, 413);
+  if (error) return json({ error: "Invalid JSON" }, 400);
 
   const message = typeof payload.message === "string" ? payload.message.trim() : "";
   const service = typeof payload.service === "string" ? payload.service : "";
@@ -119,51 +165,30 @@ async function saveFeedback(request, env, ctx) {
   return json({ ok: true }, 201);
 }
 
-async function resolveService(request) {
+async function resolveService(request, env) {
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
   if (!sameOrigin(request)) return json({ error: "Invalid origin" }, 403);
   if (!request.headers.get("content-type")?.includes("application/json")) {
     return json({ error: "JSON body required" }, 415);
   }
-  if (Number(request.headers.get("content-length") || 0) > MAX_RESOLVE_BODY_BYTES) {
-    return json({ error: "Request body is too large" }, 413);
+  if (await rateLimited(env, "API_LIMITER", request)) {
+    return json({ error: "Too many requests -- please wait a minute." }, 429);
   }
 
-  let payload;
-  try {
-    payload = await request.json();
-  } catch {
-    return json({ error: "Invalid JSON" }, 400);
-  }
+  const { payload, error } = await readJsonBody(request, MAX_RESOLVE_BODY_BYTES);
+  if (error === "too-large") return json({ error: "Request body is too large" }, 413);
+  if (error) return json({ error: "Invalid JSON" }, 400);
   const url = typeof payload.url === "string" ? payload.url : "";
   if (!url) return json({ error: "A url is required." }, 400);
 
   try {
-    const resolved = await interpretUrl(url, fetch);
+    const resolved = await interpretUrl(url, (target, init) => safeFetch(target, init));
     return json(resolved);
   } catch (error) {
     if (error instanceof ResolveError) return json({ error: error.message }, error.status);
     console.error("resolve failed", error);
     return json({ error: "Unexpected error resolving this URL." }, 500);
   }
-}
-
-function blockedProxyHost(hostname) {
-  const host = hostname.toLowerCase();
-  if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".localdomain")) {
-    return true;
-  }
-  // Literal private/loopback/link-local IPv4 addresses, as a string-level
-  // defense in depth -- Cloudflare's own edge network already cannot route a
-  // Worker's fetch() to these ranges, but this costs nothing to also check.
-  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (ipv4) {
-    const [a, b] = ipv4.slice(1).map(Number);
-    if (a === 127 || a === 10 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /**
@@ -210,9 +235,12 @@ export function limitStream(readable, maxBytes, onSettled) {
   });
 }
 
-async function proxyRequest(request) {
+async function proxyRequest(request, env) {
   if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
   if (!sameOrigin(request)) return json({ error: "Invalid origin" }, 403);
+  if (await rateLimited(env, "PROXY_LIMITER", request)) {
+    return json({ error: "Too many requests -- please wait a minute." }, 429);
+  }
 
   const target = new URL(request.url).searchParams.get("url");
   if (!target) return json({ error: "A url query parameter is required." }, 400);
@@ -223,12 +251,8 @@ async function proxyRequest(request) {
   } catch {
     return json({ error: "Invalid target URL." }, 400);
   }
-  if (!["http:", "https:"].includes(parsedTarget.protocol)) {
-    return json({ error: "Only http(s) URLs can be proxied." }, 422);
-  }
-  if (blockedProxyHost(parsedTarget.hostname)) {
-    return json({ error: "Local/private service URLs are not allowed." }, 422);
-  }
+  // Scheme and host are validated by safeFetch() below, on the first hop and
+  // on every redirect after it.
 
   const controller = new AbortController();
   // Left running for the whole streamed response, not just until headers
@@ -238,12 +262,13 @@ async function proxyRequest(request) {
   const timeout = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
   let upstream;
   try {
-    upstream = await fetch(parsedTarget.toString(), {
+    upstream = await safeFetch(parsedTarget.toString(), {
       headers: { "User-Agent": "wms-wcs-aoi-fetcher/2.0" },
       signal: controller.signal,
     });
   } catch (error) {
     clearTimeout(timeout);
+    if (error instanceof UnsafeUrlError) return json({ error: error.message }, 422);
     return json({ error: `Could not reach the source server: ${error.message}` }, 502);
   }
 
@@ -275,8 +300,8 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === "/api/feedback") return saveFeedback(request, env, ctx);
-    if (url.pathname === "/api/resolve") return resolveService(request);
-    if (url.pathname === "/api/proxy") return proxyRequest(request);
+    if (url.pathname === "/api/resolve") return resolveService(request, env);
+    if (url.pathname === "/api/proxy") return proxyRequest(request, env);
     if (url.pathname.startsWith("/api/")) return json({ error: "Not found" }, 404);
     return env.ASSETS.fetch(request);
   },

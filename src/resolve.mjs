@@ -4,6 +4,7 @@
 // same interpret_url() this app used to run inside a Cloudflare Container;
 // it now runs directly in the Worker (no GDAL needed for this part).
 import { parseElements, layerIdentifier, boxFromElement, firstLayerName, scaleDenominatorLimits } from './xml.mjs';
+import { blockedHost } from './safe-fetch.mjs';
 
 export const SUPPORTED_SERVICES = ['wms', 'wcs'];
 export const DEFAULT_VERSION = { wms: '1.3.0', wcs: '1.0.0' };
@@ -171,14 +172,13 @@ async function fetchCapabilities(fetchImpl, endpoint, service, version) {
       }
       chunks.push(value);
     }
-    text = new TextDecoder('utf-8').decode(
-      chunks.reduce((acc, chunk) => {
-        const merged = new Uint8Array(acc.length + chunk.length);
-        merged.set(acc);
-        merged.set(chunk, acc.length);
-        return merged;
-      }, new Uint8Array())
-    );
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    text = new TextDecoder('utf-8').decode(merged);
   } else {
     text = await response.text();
   }
@@ -230,8 +230,7 @@ export async function interpretUrl(rawUrl, fetchImpl) {
   if (!['http:', 'https:'].includes(url.protocol)) {
     throw new ResolveError('Paste a full http(s) WMS/WCS URL.');
   }
-  const host = url.hostname.toLowerCase();
-  if (host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.localdomain')) {
+  if (blockedHost(url.hostname)) {
     throw new ResolveError('Local service URLs are not allowed.');
   }
 

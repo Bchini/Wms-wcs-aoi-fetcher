@@ -3,15 +3,13 @@
 // which is what lets this app run on Cloudflare's free Workers plan (no
 // Containers, no paid plan).
 //
-// gdal3.js's gdalwarp() takes exactly one source dataset -- it has no
-// gdalbuildvrt and no multi-source mosaicking (verified empirically: a
-// second gdalwarp call to the same destination replaces it rather than
-// merging). So a multi-tile WMS mosaic is built by warping each tile
-// independently onto the SAME full target grid (-te/-tr) with -dstalpha
-// (transparent outside that tile's own footprint), then compositing the
-// resulting PNGs on a <canvas> -- transparent pixels simply don't overwrite
-// pixels an earlier tile already drew. The composited canvas is finally
-// re-georeferenced with one more gdal_translate -a_srs/-a_ullr call.
+// A multi-tile WMS mosaic is composited on a <canvas> instead of with GDAL:
+// gdal3.js's gdalwarp() takes exactly one source dataset and it has no
+// gdalbuildvrt. Every GetMap tile is requested in the target CRS at exactly
+// the target resolution, so it already sits on the output pixel grid -- it is
+// drawn at its pixel offset with no resampling or reprojection. GDAL (loaded
+// in parallel with the downloads) is only used once at the end, to wrap the
+// composited PNG into a georeferenced GeoTIFF.
 
 const GDAL_VERSION = '2.8.1';
 const GDAL_CDN_BASE = `https://cdn.jsdelivr.net/npm/gdal3.js@${GDAL_VERSION}/dist/package`;
@@ -58,7 +56,13 @@ function outputPath(filePath) {
 async function fetchViaProxy(url) {
   const response = await fetch(`/api/proxy?url=${encodeURIComponent(url)}`);
   if (!response.ok) {
-    const detail = await response.text().catch(() => '');
+    const text = await response.text().catch(() => '');
+    let detail = text;
+    try {
+      detail = JSON.parse(text).error || text; // the proxy answers errors as {"error": "..."}
+    } catch {
+      // not JSON -- keep the raw text
+    }
     throw new Error(detail || `The source server returned HTTP ${response.status}.`);
   }
   return new Uint8Array(await response.arrayBuffer());
@@ -75,90 +79,115 @@ export async function runWcs({ url, bounds, resolution, crs }, onProgress) {
   onProgress?.({ phase: 'fetching', done: 1, total: 1 });
 
   onProgress?.({ phase: 'processing', done: 0, total: 1 });
-  const rawFile = new File([bytes], 'coverage.tif');
-  const opened = await Gdal.open(rawFile);
-  if (!opened.datasets.length) {
+  const opened = await Gdal.open(new File([bytes], 'coverage.tif'));
+  const [source] = opened.datasets;
+  if (!source) {
     throw new Error('The server did not return a readable coverage.');
   }
-  const [minx, miny, maxx, maxy] = bounds;
-  const clipped = await Gdal.gdalwarp(opened.datasets[0], [
-    '-of', 'GTiff',
-    '-t_srs', crs,
-    '-te', String(minx), String(miny), String(maxx), String(maxy),
-    '-tr', String(resolution), String(resolution),
-    '-co', 'COMPRESS=DEFLATE',
-  ]);
-  const outBytes = await Gdal.getFileBytes(outputPath(clipped));
-  onProgress?.({ phase: 'processing', done: 1, total: 1 });
-  return new Blob([outBytes], { type: 'image/tiff' });
+  try {
+    const [minx, miny, maxx, maxy] = bounds;
+    const clipped = await Gdal.gdalwarp(source, [
+      '-of', 'GTiff',
+      '-t_srs', crs,
+      '-te', String(minx), String(miny), String(maxx), String(maxy),
+      '-tr', String(resolution), String(resolution),
+      '-co', 'COMPRESS=DEFLATE',
+    ]);
+    const outBytes = await Gdal.getFileBytes(outputPath(clipped));
+    onProgress?.({ phase: 'processing', done: 1, total: 1 });
+    return new Blob([outBytes], { type: 'image/tiff' });
+  } finally {
+    Gdal.close(source);
+  }
+}
+
+const TILE_CONCURRENCY = 3; // polite to public GIS servers, still ~3x faster than one at a time
+
+/** Run `worker` over `items` with at most `limit` in flight; stops starting new items after a failure. */
+async function mapPool(items, limit, worker) {
+  let next = 0;
+  let failed = false;
+  const lane = async () => {
+    while (!failed && next < items.length) {
+      const index = next;
+      next += 1;
+      try {
+        await worker(items[index], index);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, lane));
+}
+
+/** Decode a GetMap response, turning "the server answered with an XML error" into a readable message. */
+async function decodeTile(bytes, tile) {
+  try {
+    return await createImageBitmap(new Blob([bytes]), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+  } catch {
+    const head = new TextDecoder().decode(bytes.subarray(0, 300)).trim();
+    const detail = head.startsWith('<') ? ` The server said: ${head.replace(/\s+/g, ' ')}` : '';
+    throw new Error(`Tile r${tile.row}c${tile.col} was not a readable image.${detail}`);
+  }
 }
 
 /**
- * Fetch every WMS GetMap tile in `tiles`, georeference and warp each onto
- * the shared [minx, miny, maxx, maxy] grid, composite them, and
- * re-georeference the result. Returns a GeoTIFF Blob.
+ * Fetch every WMS GetMap tile in `tiles`, draw each at its pixel offset on a
+ * canvas covering [minx, miny, maxx, maxy], and wrap the result in a
+ * georeferenced GeoTIFF Blob. Areas with no fetched tile (tiles the user left
+ * out) stay transparent.
  */
 export async function runWms({ tiles, bounds, resolution, crs }, onProgress) {
-  const Gdal = await loadGdal();
   const [minx, miny, maxx, maxy] = bounds;
-  const teArgs = ['-te', String(minx), String(miny), String(maxx), String(maxy)];
-  const trArgs = ['-tr', String(resolution), String(resolution)];
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round((maxx - minx) / resolution));
+  canvas.height = Math.max(1, Math.round((maxy - miny) / resolution));
+  const ctx = canvas.getContext('2d');
 
-  let canvas = null;
-  let ctx = null;
+  const gdalReady = loadGdal();
+  gdalReady.catch(() => {}); // surfaced where it is awaited; avoids an unhandled rejection if a tile fails first
+
   const total = tiles.length;
-  for (let index = 0; index < tiles.length; index += 1) {
-    const tile = tiles[index];
-    onProgress?.({ phase: 'fetching', done: index, total });
-    const bytes = await fetchViaProxy(tile.url);
-
-    onProgress?.({ phase: 'processing', done: index, total });
-    const rawFile = new File([bytes], `tile_${tile.row}_${tile.col}.png`);
-    const opened = await Gdal.open(rawFile);
-    if (!opened.datasets.length) {
-      throw new Error(`Tile r${tile.row}c${tile.col} was not a readable image.`);
+  let done = 0;
+  onProgress?.({ phase: 'tiles', done, total });
+  await mapPool(tiles, TILE_CONCURRENCY, async (tile) => {
+    const bitmap = await decodeTile(await fetchViaProxy(tile.url), tile);
+    try {
+      const x = Math.round((tile.txmin - minx) / resolution);
+      const y = Math.round((maxy - tile.tymax) / resolution);
+      // Scaled to the planned size so a server that clamps the image still lands on the grid.
+      ctx.drawImage(bitmap, x, y, tile.width, tile.height);
+    } finally {
+      bitmap.close();
     }
-    const georeferenced = await Gdal.gdal_translate(opened.datasets[0], [
-      '-of', 'GTiff',
-      '-a_srs', crs,
-      '-a_ullr', String(tile.txmin), String(tile.tymax), String(tile.txmax), String(tile.tymin),
-    ]);
-    const openedGeo = await Gdal.open(outputPath(georeferenced));
-    const warped = await Gdal.gdalwarp(openedGeo.datasets[0], [
-      '-of', 'GTiff', '-t_srs', crs, ...teArgs, ...trArgs, '-r', 'near', '-dstalpha',
-    ]);
-    const openedWarped = await Gdal.open(outputPath(warped));
-    const [width, height] = openedWarped.datasets[0].info.size;
-    const png = await Gdal.gdal_translate(openedWarped.datasets[0], ['-of', 'PNG']);
-    const pngBytes = await Gdal.getFileBytes(outputPath(png));
-
-    if (!canvas) {
-      canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      ctx = canvas.getContext('2d');
-    }
-    const bitmap = await createImageBitmap(new Blob([pngBytes], { type: 'image/png' }));
-    ctx.drawImage(bitmap, 0, 0);
-    bitmap.close();
-  }
-  onProgress?.({ phase: 'fetching', done: total, total });
-
-  if (!canvas) {
-    throw new Error('No tiles were produced for this area.');
-  }
+    done += 1;
+    onProgress?.({ phase: 'tiles', done, total });
+  });
 
   onProgress?.({ phase: 'compositing', done: 0, total: 1 });
-  const compositedBlob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
-  const compositedFile = new File([compositedBlob], 'composited.png');
-  const openedComposited = await Gdal.open(compositedFile);
-  const finalTif = await Gdal.gdal_translate(openedComposited.datasets[0], [
-    '-of', 'GTiff',
-    '-a_srs', crs,
-    '-a_ullr', String(minx), String(maxy), String(maxx), String(miny),
-    '-co', 'COMPRESS=DEFLATE',
-  ]);
-  const finalBytes = await Gdal.getFileBytes(outputPath(finalTif));
-  onProgress?.({ phase: 'compositing', done: 1, total: 1 });
-  return new Blob([finalBytes], { type: 'image/tiff' });
+  const Gdal = await gdalReady;
+  const compositedBlob = await new Promise((resolve, reject) =>
+    canvas.toBlob(
+      (blob) => (blob ? resolve(blob) : reject(new Error('The mosaic is too large for this browser to encode.'))),
+      'image/png'
+    )
+  );
+  const opened = await Gdal.open(new File([compositedBlob], 'composited.png'));
+  const [composited] = opened.datasets;
+  if (!composited) throw new Error('Could not read back the composited mosaic.');
+  try {
+    const finalTif = await Gdal.gdal_translate(composited, [
+      '-of', 'GTiff',
+      '-a_srs', crs,
+      '-a_ullr', String(minx), String(maxy), String(maxx), String(miny),
+      '-co', 'COMPRESS=DEFLATE',
+    ]);
+    const finalBytes = await Gdal.getFileBytes(outputPath(finalTif));
+    onProgress?.({ phase: 'compositing', done: 1, total: 1 });
+    return new Blob([finalBytes], { type: 'image/tiff' });
+  } finally {
+    Gdal.close(composited);
+  }
 }

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { notifyFeedback, limitStream } from '../src/worker.mjs';
+import worker, { notifyFeedback, limitStream } from '../src/worker.mjs';
 
 async function drain(readable) {
   const reader = readable.getReader();
@@ -122,4 +122,103 @@ test('limitStream calls onSettled exactly once when the cap is exceeded', async 
   const source = streamOfChunks([5000, 5000, 5000]);
   await assert.rejects(() => drain(limitStream(source, 10_000, () => { settledCount += 1; })));
   assert.equal(settledCount, 1);
+});
+
+// -- request handling: size caps, rate limits and redirect safety ----------
+const ctx = { waitUntil() {} };
+
+function chunkedBody(totalBytes, chunkSize = 1024) {
+  let sent = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (sent >= totalBytes) return controller.close();
+      const size = Math.min(chunkSize, totalBytes - sent);
+      sent += size;
+      controller.enqueue(new Uint8Array(size).fill(0x20));
+    },
+  });
+}
+
+function jsonPost(path, body, init = {}) {
+  return new Request(`https://app.test${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+    duplex: 'half',
+    ...init,
+  });
+}
+
+test('/api/resolve rejects an oversized chunked body even with no Content-Length', async () => {
+  const response = await worker.fetch(jsonPost('/api/resolve', chunkedBody(64 * 1024)), {}, ctx);
+  assert.equal(response.status, 413);
+});
+
+test('/api/feedback rejects an oversized chunked body even with no Content-Length', async () => {
+  const response = await worker.fetch(jsonPost('/api/feedback', chunkedBody(64 * 1024)), {}, ctx);
+  assert.equal(response.status, 413);
+});
+
+test('/api/resolve rejects a JSON body that is not an object', async () => {
+  const response = await worker.fetch(jsonPost('/api/resolve', 'null'), {}, ctx);
+  assert.equal(response.status, 400);
+});
+
+test('/api/resolve answers 429 when its rate limit is exhausted', async () => {
+  const env = { API_LIMITER: { limit: async () => ({ success: false }) } };
+  const response = await worker.fetch(jsonPost('/api/resolve', JSON.stringify({ url: 'https://a.test/wms' })), env, ctx);
+  assert.equal(response.status, 429);
+});
+
+test('/api/proxy answers 429 when its rate limit is exhausted', async () => {
+  const env = { PROXY_LIMITER: { limit: async () => ({ success: false }) } };
+  const response = await worker.fetch(new Request('https://app.test/api/proxy?url=https%3A%2F%2Fa.test%2Fx'), env, ctx);
+  assert.equal(response.status, 429);
+});
+
+test('/api/proxy keys its rate limit on the client IP', async () => {
+  const keys = [];
+  const env = { PROXY_LIMITER: { limit: async ({ key }) => { keys.push(key); return { success: true }; } } };
+  await withFetchStub(
+    async () => new Response('ok', { status: 200 }),
+    () => worker.fetch(
+      new Request('https://app.test/api/proxy?url=https%3A%2F%2Fa.test%2Fx', { headers: { 'CF-Connecting-IP': '203.0.113.9' } }),
+      env,
+      ctx
+    )
+  );
+  assert.deepEqual(keys, ['203.0.113.9']);
+});
+
+test('/api/proxy refuses a private target without fetching it', async () => {
+  let called = false;
+  const response = await withFetchStub(
+    async () => { called = true; return new Response('x'); },
+    () => worker.fetch(new Request('https://app.test/api/proxy?url=http%3A%2F%2F169.254.169.254%2F'), {}, ctx)
+  );
+  assert.equal(response.status, 422);
+  assert.equal(called, false);
+});
+
+test('/api/proxy refuses a public URL that redirects onto a private host', async () => {
+  const fetched = [];
+  const response = await withFetchStub(
+    async (url) => {
+      fetched.push(url);
+      return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:8080/admin' } });
+    },
+    () => worker.fetch(new Request('https://app.test/api/proxy?url=https%3A%2F%2Fa.test%2Fx'), {}, ctx)
+  );
+  assert.equal(response.status, 422);
+  assert.deepEqual(fetched, ['https://a.test/x']);
+});
+
+test('/api/proxy streams a normal upstream response through', async () => {
+  const response = await withFetchStub(
+    async () => new Response('tile-bytes', { status: 200, headers: { 'content-type': 'image/png' } }),
+    () => worker.fetch(new Request('https://app.test/api/proxy?url=https%3A%2F%2Fa.test%2Fx'), {}, ctx)
+  );
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'image/png');
+  assert.equal(await response.text(), 'tile-bytes');
 });
