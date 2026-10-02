@@ -29,17 +29,29 @@ function loadScript(src, integrity) {
     script.integrity = integrity;
     script.crossOrigin = 'anonymous';
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error(`Could not load ${src}`));
+    script.onerror = () => {
+      script.remove(); // a failed tag must not linger, or a retry would stack a second one
+      reject(new Error(`Could not load ${src}`));
+    };
     document.head.appendChild(script);
   });
 }
 
 let leafletPromise = null;
-/** Load Leaflet (once) and return its global `L` namespace. */
+/**
+ * Load Leaflet (once) and return its global `L` namespace. A failed load is
+ * not cached: a transient CDN error shouldn't disable the picker until the
+ * page is reloaded.
+ */
 function loadLeaflet() {
   if (!leafletPromise) {
     loadStylesheet(`${LEAFLET_BASE}/leaflet.min.css`, LEAFLET_CSS_INTEGRITY);
-    leafletPromise = loadScript(`${LEAFLET_BASE}/leaflet.min.js`, LEAFLET_JS_INTEGRITY).then(() => window.L);
+    leafletPromise = loadScript(`${LEAFLET_BASE}/leaflet.min.js`, LEAFLET_JS_INTEGRITY)
+      .then(() => window.L)
+      .catch((error) => {
+        leafletPromise = null;
+        throw error;
+      });
   }
   return leafletPromise;
 }

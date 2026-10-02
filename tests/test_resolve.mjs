@@ -181,6 +181,33 @@ test('requesting a CRS with no known transform falls back to the CRS the bounds 
   assert.deepEqual(resolved.bounds, [-10, 30, 10, 50]);
 });
 
+test('non-OGC query parameters (map=, API keys) stay on the endpoint and on the capabilities request', async () => {
+  const requested = [];
+  const fetchImpl = async (url) => {
+    requested.push(url);
+    return textResponse(WMS_CAPABILITIES);
+  };
+  const resolved = await interpretUrl(
+    'https://example.test/cgi-bin/mapserv?map=/maps/x.map&KEY=secret&SERVICE=WMS&REQUEST=GetCapabilities',
+    fetchImpl
+  );
+  assert.equal(resolved.endpoint, 'https://example.test/cgi-bin/mapserv?map=%2Fmaps%2Fx.map&KEY=secret');
+  const capabilitiesUrl = new URL(requested[0]);
+  assert.equal(capabilitiesUrl.searchParams.get('map'), '/maps/x.map');
+  assert.equal(capabilitiesUrl.searchParams.get('KEY'), 'secret');
+  assert.equal(capabilitiesUrl.searchParams.get('REQUEST'), 'GetCapabilities');
+});
+
+test('OGC parameters are not left on the endpoint (they are rebuilt per request)', async () => {
+  const fetchImpl = fakeFetch({ wms: WMS_CAPABILITIES });
+  const resolved = await interpretUrl(
+    'https://example.test/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=demo:layer_a&CRS=EPSG:4326' +
+      '&BBOX=40,-4,41,-3&WIDTH=100&HEIGHT=100&FORMAT=image/png',
+    fetchImpl
+  );
+  assert.equal(resolved.endpoint, 'https://example.test/wms');
+});
+
 test('CRS:84 in a literal GetMap BBOX is kept as lon/lat, not force-relabeled to EPSG:4326', async () => {
   const fetchImpl = fakeFetch({ wms: WMS_CAPABILITIES });
   const resolved = await interpretUrl(

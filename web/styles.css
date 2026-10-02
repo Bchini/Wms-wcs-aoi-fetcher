@@ -1,5 +1,6 @@
 :root { --ink:#11251f; --green:#164f42; --lime:#d7f55f; --paper:#f5f1e9; --line:#d7d1c5; --muted:#5d6862; }
 * { box-sizing:border-box; }
+[hidden] { display:none !important; }
 body { margin:0; color:var(--ink); background:var(--paper); font:16px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
 main { max-width:1160px; padding:72px 28px 44px; margin:auto; }
 .hero { max-width:780px; margin-bottom:34px; }

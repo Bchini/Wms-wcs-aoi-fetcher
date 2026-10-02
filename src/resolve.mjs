@@ -27,9 +27,25 @@ function queryParams(url) {
   return params;
 }
 
+// Parameters this app builds itself for every request; anything else on the
+// pasted URL (MapServer's `map=`, QGIS Server's `MAP=`, API keys, tokens...)
+// belongs to the endpoint and must survive onto every request we send.
+const OGC_PARAMS = new Set([
+  'SERVICE', 'VERSION', 'REQUEST', 'ACCEPTVERSIONS', 'UPDATESEQUENCE', 'SECTIONS',
+  'LAYERS', 'LAYER', 'STYLES', 'STYLE', 'SLD', 'SLD_BODY', 'CRS', 'SRS', 'BBOX',
+  'WIDTH', 'HEIGHT', 'FORMAT', 'TRANSPARENT', 'BGCOLOR', 'EXCEPTIONS', 'TIME', 'ELEVATION',
+  'COVERAGE', 'COVERAGEID', 'RESX', 'RESY', 'RESPONSE_CRS', 'SUBSET', 'TYPENAME', 'TYPENAMES',
+  'QUERY_LAYERS', 'INFO_FORMAT', 'FEATURE_COUNT', 'I', 'J', 'X', 'Y',
+]);
+
 function endpointOnly(url) {
   const parsed = new URL(url);
-  return `${parsed.origin}${parsed.pathname}`;
+  const kept = new URLSearchParams();
+  for (const [key, value] of parsed.searchParams) {
+    if (!OGC_PARAMS.has(key.toUpperCase())) kept.append(key, value);
+  }
+  const query = kept.toString();
+  return `${parsed.origin}${parsed.pathname}${query ? `?${query}` : ''}`;
 }
 
 function guessServiceFromPath(url) {

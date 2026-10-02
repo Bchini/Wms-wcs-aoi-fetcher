@@ -26,18 +26,27 @@ function loadScript(src, integrity) {
       script.crossOrigin = 'anonymous';
     }
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error(`Could not load ${src}`));
+    script.onerror = () => {
+      script.remove(); // a failed tag must not linger, or a retry would stack a second one
+      reject(new Error(`Could not load ${src}`));
+    };
     document.head.appendChild(script);
   });
 }
 
 let gdalPromise = null;
-/** Load gdal3.js (once) and return its initialized API object. */
+/**
+ * Load gdal3.js (once) and return its initialized API object. A failed load
+ * is not cached, so a transient CDN error doesn't need a page reload.
+ */
 export function loadGdal() {
   if (!gdalPromise) {
-    gdalPromise = loadScript(`${GDAL_CDN_BASE}/gdal3.js`, GDAL_SCRIPT_INTEGRITY).then(() =>
-      window.initGdalJs({ path: GDAL_CDN_BASE, useWorker: false })
-    );
+    gdalPromise = loadScript(`${GDAL_CDN_BASE}/gdal3.js`, GDAL_SCRIPT_INTEGRITY)
+      .then(() => window.initGdalJs({ path: GDAL_CDN_BASE, useWorker: false }))
+      .catch((error) => {
+        gdalPromise = null;
+        throw error;
+      });
   }
   return gdalPromise;
 }

@@ -41,13 +41,14 @@
             <div class="aoi-actions" id="aoi-actions" hidden><button type="button" class="aoi-clear" id="aoi-clear">Remove AOI</button></div>
 
             <div class="tile-picker" id="tile-picker-section" hidden>
-              <p class="hint">Click tiles to choose exactly which ones to download — the rest are left blank in the final GeoTIFF.</p>
+              <p class="hint" id="tile-picker-hint">Click tiles to choose exactly which ones to download — the rest are left blank in the final GeoTIFF.</p>
               <div class="tile-picker-map" id="tile-picker-map"></div>
-              <div class="tile-picker-actions">
+              <div class="tile-picker-actions" id="tile-picker-actions">
                 <button type="button" id="tile-picker-select-all">Select all</button>
                 <button type="button" id="tile-picker-clear">Clear</button>
-                <span class="tile-picker-status" id="tile-picker-status"></span>
+                <span class="tile-picker-status" id="tile-picker-status" aria-live="polite"></span>
               </div>
+              <p class="hint" id="tile-picker-note" hidden></p>
             </div>
           </div>
           <button class="launch" type="submit" id="launch-button">DETECT</button>

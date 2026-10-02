@@ -31,6 +31,9 @@ const scaleWarningEl = document.querySelector('#scale-warning');
 const tilePickerSection = document.querySelector('#tile-picker-section');
 const tilePickerMap = document.querySelector('#tile-picker-map');
 const tilePickerStatus = document.querySelector('#tile-picker-status');
+const tilePickerHint = document.querySelector('#tile-picker-hint');
+const tilePickerActions = document.querySelector('#tile-picker-actions');
+const tilePickerNote = document.querySelector('#tile-picker-note');
 const tilePickerSelectAll = document.querySelector('#tile-picker-select-all');
 const tilePickerClearButton = document.querySelector('#tile-picker-clear');
 const processStatus = document.querySelector('#process-status');
@@ -66,11 +69,27 @@ function resetAoi() {
   aoiActions.hidden = true;
 }
 
-function destroyTilePicker() {
+/** Drop the picker instance and its tile list together -- they must never be out of step. */
+function disposeTilePicker() {
   if (tilePicker) tilePicker.destroy();
   tilePicker = null;
   tilePickerTiles = [];
+}
+
+function destroyTilePicker() {
+  disposeTilePicker();
   tilePickerSection.hidden = true;
+}
+
+/** 'map' shows the picker; 'unavailable' shows only `message` (the map couldn't load, every tile will be downloaded). */
+function showTilePickerSection(mode, message = '') {
+  const showMap = mode === 'map';
+  tilePickerSection.hidden = false;
+  tilePickerHint.hidden = !showMap;
+  tilePickerMap.hidden = !showMap;
+  tilePickerActions.hidden = !showMap;
+  tilePickerNote.hidden = showMap;
+  tilePickerNote.textContent = message;
 }
 
 function resetDetection() {
@@ -126,16 +145,30 @@ function updateTilePickerStatus() {
   tilePickerStatus.textContent = `${n} of ${total} tile${total > 1 ? 's' : ''} selected — click a tile to toggle it.`;
 }
 
+// Rebuilds are serialized through one promise chain and tagged with a
+// generation number: two overlapping builds on the same map container would
+// make Leaflet throw "Map container is already initialized", and a build
+// that finishes after a newer request must not overwrite the newer picker.
+let rebuildGeneration = 0;
+let rebuildQueue = Promise.resolve();
+
 /**
- * (Re)build the tile-selection map for the current bounds/resolution, or
- * hide it when there's nothing to usefully pick from: WCS (never tiled),
- * a CRS the map can't display, or just a single tile. Called after every
- * change that affects the tile grid's shape (resolution, AOI) so the
- * picker shown is always the one `resolveRunParams()` will actually use --
- * runDownload() double-checks this by comparing tile counts before trusting
- * the picker's selection.
+ * Queue a (re)build of the tile-selection map for the current
+ * bounds/resolution. Call it after every change that affects the tile grid
+ * (resolution, AOI). The returned promise settles when the picker reflects
+ * that state and never rejects; the submit handler awaits `rebuildQueue` so a
+ * download can't start against a half-built picker.
  */
-async function rebuildTilePicker() {
+function rebuildTilePicker() {
+  rebuildGeneration += 1;
+  const generation = rebuildGeneration;
+  rebuildQueue = rebuildQueue.then(() => buildTilePicker(generation)).catch(() => {});
+  return rebuildQueue;
+}
+
+async function buildTilePicker(generation) {
+  if (generation !== rebuildGeneration) return; // a newer request is already queued behind us
+  disposeTilePicker();
   if (!detected || detected.service !== 'wms') {
     destroyTilePicker();
     return;
@@ -147,8 +180,7 @@ async function rebuildTilePicker() {
     destroyTilePicker(); // an over-budget custom width -- the real error shows up when DOWNLOAD is pressed
     return;
   }
-  const bounds = effectiveBounds();
-  const [minx, miny, maxx, maxy] = bounds;
+  const [minx, miny, maxx, maxy] = effectiveBounds();
   const tiles = planWmsTiles({ minx, miny, maxx, maxy, tileW: WMS_TILE_SIZE, tileH: WMS_TILE_SIZE, resolution });
 
   if (!TILE_PICKER_CRS.has(detected.crs.toUpperCase()) || tiles.length <= 1) {
@@ -162,16 +194,25 @@ async function rebuildTilePicker() {
     if (reprojected) initialSelection = tilesIntersectingPolygons(tiles, reprojected);
   }
 
-  if (tilePicker) tilePicker.destroy();
-  tilePickerSection.hidden = false;
-  tilePickerTiles = tiles;
-  tilePicker = await createTilePicker(tilePickerMap, {
-    tiles,
-    toLonLat: (x, y) => reprojectPointToLonLat(x, y, detected.crs),
-    initialSelection,
-    onChange: updateTilePickerStatus,
-  });
-  updateTilePickerStatus();
+  showTilePickerSection('map'); // Leaflet measures its container once, so it must be visible before construction
+  try {
+    const picker = await createTilePicker(tilePickerMap, {
+      tiles,
+      toLonLat: (x, y) => reprojectPointToLonLat(x, y, detected.crs),
+      initialSelection,
+      onChange: updateTilePickerStatus,
+    });
+    if (generation !== rebuildGeneration) {
+      picker.destroy(); // superseded while Leaflet was loading
+      return;
+    }
+    tilePicker = picker;
+    tilePickerTiles = tiles;
+    updateTilePickerStatus();
+  } catch (error) {
+    // The picker is a convenience: without it every tile is simply downloaded.
+    showTilePickerSection('unavailable', `The tile map couldn't load (${error.message}). All tiles will be downloaded.`);
+  }
 }
 resolutionSelect.addEventListener('change', rebuildTilePicker);
 customWidthInput.addEventListener('change', rebuildTilePicker);
@@ -341,7 +382,7 @@ async function detect(url) {
     detectedSummary.textContent =
       `${resolved.service.toUpperCase()} · ${resolved.layer} · ${resolved.crs}`;
     refreshScaleWarning();
-    await rebuildTilePicker();
+    rebuildTilePicker(); // not awaited: the map loads in the background, DETECT shouldn't wait on it
     processStatus.textContent = 'Choose a resolution, then press DOWNLOAD GEOTIFF.';
     launchButton.textContent = 'DOWNLOAD GEOTIFF';
   } catch (error) {
@@ -450,6 +491,8 @@ form.addEventListener('submit', async (event) => {
   }
   const url = urlField.value.trim();
   if (detected && detectedForUrl === url) {
+    await rebuildQueue; // a blur on the custom-width field queues a rebuild just before this click lands
+    if (!detected) return; // the URL was edited while we waited
     let bounds, resolution;
     try {
       ({ bounds, resolution } = resolveRunParams(detected));
